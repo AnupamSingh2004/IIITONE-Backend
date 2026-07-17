@@ -30,9 +30,21 @@ func TestLoad_AllVarsPresent(t *testing.T) {
 }
 
 func TestLoad_MissingRequiredVar(t *testing.T) {
-	t.Setenv("DATABASE_URL", "")
+	required := []string{"DATABASE_URL", "REDIS_ADDR", "STORAGE_ENDPOINT", "GOOGLE_ALLOWED_DOMAIN", "JWT_SECRET"}
 
-	_, err := Load()
+	for _, missing := range required {
+		t.Run(missing, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://x")
+			t.Setenv("REDIS_ADDR", "localhost:6379")
+			t.Setenv("STORAGE_ENDPOINT", "localhost:9000")
+			t.Setenv("GOOGLE_ALLOWED_DOMAIN", "iiitdmj.ac.in")
+			t.Setenv("JWT_SECRET", "s3cr3t")
+			t.Setenv(missing, "")
 
-	require.Error(t, err)
+			_, err := Load()
+
+			require.Error(t, err)
+			require.Contains(t, err.Error(), missing)
+		})
+	}
 }
