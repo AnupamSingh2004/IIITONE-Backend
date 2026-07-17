@@ -18,6 +18,7 @@ Repos are created locally (git-initialized) but **not pushed to GitHub yet** —
 - No in-app payments (permanent non-goal for the whole product, not just Phase 1).
 - No automated ML moderation — manual admin review queue only.
 - No production deploy automation in this spec beyond describing the target (Azure + Cloudflare); actual CI/CD secrets and pipelines are an implementation-time task.
+- No WebSocket/realtime protocol in Phase 1 (no chat, nothing realtime exists in this vertical) — full WebSocket protocol spec is a Phase 2 (Marketplace chat) artifact, not produced here.
 
 ## Repos
 
@@ -27,7 +28,7 @@ Repos are created locally (git-initialized) but **not pushed to GitHub yet** —
 
 ## Data Model (Phase 1 scope)
 
-```
+```sql
 users
   id UUID PK
   email TEXT UNIQUE NOT NULL        -- must end @iiitdmj.ac.in
@@ -41,14 +42,14 @@ users
 
 courses
   id UUID PK
-  code TEXT NOT NULL
+  code TEXT                              -- nullable; seeded courses have a real code, user-added ones may not
   name TEXT NOT NULL
   branch TEXT NOT NULL
   year INT NOT NULL
   semester INT NOT NULL
   created_by UUID REFERENCES users(id)   -- who added it (seed = null/admin)
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-  UNIQUE (code, branch, year, semester)
+  UNIQUE (name, branch, year, semester)  -- find-or-create key; code plays no role in identity
 
 materials
   id UUID PK
@@ -62,7 +63,8 @@ materials
   has_text_layer BOOLEAN NOT NULL DEFAULT false
   extracted_text TEXT                -- null if has_text_layer = false
   search_vector TSVECTOR             -- generated from title + extracted_text
-  status TEXT NOT NULL DEFAULT 'pending'  -- 'pending' | 'approved' | 'rejected'
+  status TEXT NOT NULL DEFAULT 'pending'  -- 'pending' | 'approved' (only two states; see Moderation —
+                                            -- rejection hard-deletes the row rather than setting a 'rejected' status)
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 
 flags
@@ -82,7 +84,7 @@ An ER diagram (Mermaid) will be checked into `iiitone-backend/docs/er-diagram.md
 
 Single Go service, domain-packaged (not microservices):
 
-```
+```text
 /cmd/server
 /internal/auth        - Google OAuth callback, hd-claim + email-suffix validation, JWT issuance, httpOnly cookie session middleware
 /internal/users       - profile read/update, admin ban/unban
@@ -109,15 +111,16 @@ Single Go service, domain-packaged (not microservices):
 
 ### Upload flow
 
-1. Client uploads a PDF via multipart form (title, course_id or new-course fields, type).
-2. Backend streams the file while computing SHA-256.
-3. If `content_hash` already exists in `materials`, reject with a "duplicate" error (no new row, no storage write).
-4. Attempt text-layer extraction using `pdfcpu` (pure Go, no license concerns for this scale).
+1. Client uploads a PDF via multipart form (title, course_id **or** a new-course name + branch/year/semester, type).
+2. Backend rejects non-PDF uploads outright via content-type/magic-byte check before any further processing.
+3. Backend streams the file while computing SHA-256.
+4. If a row with that `content_hash` already exists, reject with a "duplicate" error (no new row, no storage write). Since rejection hard-deletes the row (see Moderation), a previously-rejected file's hash is simply gone from the table and free to resubmit — no special-casing needed here.
+5. If the submitted course is a new free-typed name rather than an existing `course_id`, resolve it first via find-or-create: `INSERT INTO courses (...) VALUES (...) ON CONFLICT (name, branch, year, semester) DO UPDATE SET name = EXCLUDED.name RETURNING id` (the no-op `DO UPDATE` is what makes `RETURNING id` work on a conflict) — this makes concurrent submissions of the same new course race-safe; both resolve to the same `course_id` instead of one failing.
+6. Attempt text-layer extraction using `pdfcpu` (pure Go, no license concerns for this scale).
    - Text found → store it in `extracted_text`, `has_text_layer = true`, `search_vector` generated from title + extracted text.
-   - No text layer → `has_text_layer = false`, `extracted_text = null`. The file is still stored and still fully accessible/viewable — it's just not full-text searchable by content (title search still applies).
-5. Upload the raw file to object storage under a content-hash-derived key.
-6. Insert `materials` row with `status = 'pending'`.
-7. If the submitted course wasn't an existing `courses.id` but a new free-typed name, insert it into `courses` first (scoped to the branch/year/semester the uploader selected) and reference it — this is how the dropdown grows over time.
+   - No text layer, or the file is corrupted/encrypted and `pdfcpu` errors out → degrade gracefully: `has_text_layer = false`, `extracted_text = null`. The upload is **not** failed in this case — the file is still stored and still fully accessible/viewable, just not full-text searchable by content (title search still applies).
+7. Upload the raw file to object storage under a content-hash-derived key.
+8. Insert `materials` row with `status = 'pending'`.
 
 ### Search flow (Phase 1)
 
@@ -128,8 +131,9 @@ Single Go service, domain-packaged (not microservices):
 ### Moderation
 
 - `/admin/*` routes, gated by middleware requiring `users.role == 'admin'`. Initially only the project owner has `role = 'admin'` (set directly in the DB or via a seed migration — no self-service admin promotion in Phase 1).
-- Pending-uploads queue: list `status = 'pending'` materials, approve → `status = 'approved'`, reject → `status = 'rejected'` (file stays in storage but is excluded from search/browse).
-- Flags queue: list `status = 'open'` flags; resolving a flag can optionally ban the uploader (`users.status = 'banned'`), which blocks future login at the auth-callback step.
+- Pending-uploads queue: list `status = 'pending'` materials. Approve → `status = 'approved'`. Reject → the row and its storage object are **hard-deleted** immediately (no `rejected` status value exists) — this is what frees its `content_hash` for resubmission.
+- Flags queue: list `status = 'open'` flags on **already-approved** materials; resolving a flag lets the admin (a) reject the flagged material itself (same reject-and-delete path as above, removing it from search immediately) and/or (b) ban the uploader (`users.status = 'banned'`), independently. These are separate actions — a bad upload can be pulled without necessarily banning the uploader, and vice versa.
+- **Banned users' other approved uploads are not retroactively removed.** Banning only blocks future login (auth-callback step 5); it does not change the `status` of that user's existing `approved` materials, since those were already vetted by an admin and remain useful to other students. If a specific upload is itself the problem, it must be rejected individually via the flags queue, not implied by a ban.
 
 ## Web App (`iiitone-web`)
 
@@ -150,6 +154,7 @@ Session: backend-issued httpOnly JWT cookie; the React app never touches the tok
 **Local dev:** `docker-compose.yml` in `iiitone-backend` brings up Postgres, Redis, MinIO (S3-compatible, local object storage stand-in), and the backend container — `docker compose up` is the one-command local stack. `iiitone-web` runs separately via its own dev server (`npm run dev`), pointed at the local backend via `.env`.
 
 **Production targets:**
+
 - Backend (`iiitone-backend`) → **Azure Container Apps**, backed by **Azure Database for PostgreSQL** (managed) and **Azure Cache for Redis** (managed).
 - Object storage (prod) → **Azure Blob Storage**, accessed through the same `/internal/storage` interface used for MinIO locally (swap implementation, not callers).
 - Frontend (`iiitone-web`) → **Cloudflare Pages**.
@@ -169,7 +174,8 @@ Session: backend-issued httpOnly JWT cookie; the React app never touches the tok
 - [x] Monorepo→multi-repo split: `iiitone-backend`, `iiitone-web` (mobile deferred).
 - [ ] ER diagram (Mermaid) — `iiitone-backend/docs/er-diagram.md`.
 - [ ] OpenAPI 3.0 spec for REST endpoints — `iiitone-backend/docs/openapi.yaml`.
-- [ ] WebSocket protocol spec — stubbed as "Phase 2, not yet implemented" placeholder doc, since Phase 1 has no realtime feature.
 - [ ] One-command local dev stack (`docker compose up` in `iiitone-backend`).
+
+(No WebSocket protocol spec in this checklist — see Non-goals; it's a Phase 2 artifact.)
 
 These are implementation-time artifacts, produced during the build (next: implementation plan), not part of this design doc itself.
