@@ -14,6 +14,7 @@ func TestValidateCollegeIdentity(t *testing.T) {
 		{"missing hd claim entirely", "student@iiitdmj.ac.in", "", false},
 		{"correct hd but wrong email suffix", "student@gmail.com", "iiitdmj.ac.in", false},
 		{"both wrong", "student@gmail.com", "gmail.com", false},
+		{"subdomain email does not satisfy the parent-domain hd claim", "student@sub.iiitdmj.ac.in", "iiitdmj.ac.in", false},
 	}
 
 	for _, tt := range tests {
@@ -23,5 +24,12 @@ func TestValidateCollegeIdentity(t *testing.T) {
 				t.Errorf("ValidateCollegeIdentity(%q, %q) = %v, want %v", tt.email, tt.hd, got, tt.wantValid)
 			}
 		})
+	}
+}
+
+func TestValidateCollegeIdentity_EmptyAllowedDomainFailsClosed(t *testing.T) {
+	// A misconfigured (empty) allowed domain must deny everyone, not allow-all.
+	if ValidateCollegeIdentity("student@iiitdmj.ac.in", "", "") {
+		t.Error("ValidateCollegeIdentity with empty allowedDomain must return false, got true")
 	}
 }
