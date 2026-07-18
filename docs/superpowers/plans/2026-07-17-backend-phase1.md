@@ -2525,6 +2525,17 @@ func TestSearch_RanksTitleMatchAndExcludesPending(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	require.Equal(t, approvedID, results[0].ID)
+	// Result must carry enough to render a card without a second round-trip —
+	// the frontend's MaterialCard needs type/courseName/hasTextLayer directly.
+	require.Equal(t, "notes", results[0].Type)
+	require.Equal(t, "Operating Systems", results[0].CourseName)
+	require.False(t, results[0].HasTextLayer)
+
+	// course_id/type filters must actually narrow results, not be silently ignored.
+	wrongType := "pyq"
+	filtered, err := searchRepo.Query(ctx, Query{Text: "deadlock", Type: &wrongType})
+	require.NoError(t, err)
+	require.Empty(t, filtered, "type filter must exclude a non-matching type")
 }
 ```
 
@@ -2577,14 +2588,20 @@ type Query struct {
 	Type     *string
 }
 
+// Result matches the frontend's MaterialSummary shape exactly (see
+// iiitone-web's src/components/materials/MaterialCard.tsx) so the browse page
+// can render a card directly from a search result with no second round-trip.
 type Result struct {
-	ID    uuid.UUID `json:"id"`
-	Title string    `json:"title"`
-	Rank  float64   `json:"rank"`
+	ID           uuid.UUID `json:"id"`
+	Title        string    `json:"title"`
+	Type         string    `json:"type"`
+	CourseName   string    `json:"courseName"`
+	HasTextLayer bool      `json:"hasTextLayer"`
+	Rank         float64   `json:"rank"`
 }
 
 func (r *Repository) Query(ctx context.Context, q Query) ([]Result, error) {
-	cacheKey := "search:" + q.Text
+	cacheKey := cacheKeyFor(q)
 	if r.cache != nil {
 		if cached, err := r.cache.Get(ctx, cacheKey).Result(); err == nil {
 			var results []Result
@@ -2595,13 +2612,18 @@ func (r *Repository) Query(ctx context.Context, q Query) ([]Result, error) {
 	}
 
 	sqlQuery := `
-		SELECT id, title, ts_rank(search_vector, plainto_tsquery('english', $1)) AS rank
-		FROM materials
-		WHERE status = 'approved' AND search_vector @@ plainto_tsquery('english', $1)
+		SELECT m.id, m.title, m.type, c.name, m.has_text_layer,
+		       ts_rank(m.search_vector, plainto_tsquery('english', $1)) AS rank
+		FROM materials m
+		JOIN courses c ON c.id = m.course_id
+		WHERE m.status = 'approved'
+		  AND m.search_vector @@ plainto_tsquery('english', $1)
+		  AND ($2::uuid IS NULL OR m.course_id = $2)
+		  AND ($3::text IS NULL OR m.type = $3)
 		ORDER BY rank DESC
 		LIMIT 50
 	`
-	rows, err := r.pool.Query(ctx, sqlQuery, q.Text)
+	rows, err := r.pool.Query(ctx, sqlQuery, q.Text, q.CourseID, q.Type)
 	if err != nil {
 		return nil, err
 	}
@@ -2610,7 +2632,7 @@ func (r *Repository) Query(ctx context.Context, q Query) ([]Result, error) {
 	var results []Result
 	for rows.Next() {
 		var res Result
-		if err := rows.Scan(&res.ID, &res.Title, &res.Rank); err != nil {
+		if err := rows.Scan(&res.ID, &res.Title, &res.Type, &res.CourseName, &res.HasTextLayer, &res.Rank); err != nil {
 			return nil, err
 		}
 		results = append(results, res)
@@ -2626,6 +2648,19 @@ func (r *Repository) Query(ctx context.Context, q Query) ([]Result, error) {
 	}
 
 	return results, nil
+}
+
+// cacheKeyFor must fold every filter into the key — a cache hit on text alone
+// would silently return results for the wrong course/type filter combination.
+func cacheKeyFor(q Query) string {
+	key := "search:" + q.Text
+	if q.CourseID != nil {
+		key += ":course=" + q.CourseID.String()
+	}
+	if q.Type != nil {
+		key += ":type=" + *q.Type
+	}
+	return key
 }
 ```
 
@@ -2643,6 +2678,8 @@ package search
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/google/uuid"
 )
 
 type Handlers struct {
@@ -2654,8 +2691,16 @@ func NewHandlers(repo *Repository) *Handlers {
 }
 
 func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
-	text := r.URL.Query().Get("q")
-	results, err := h.repo.Query(r.Context(), Query{Text: text})
+	q := Query{Text: r.URL.Query().Get("q")}
+
+	if courseID, err := uuid.Parse(r.URL.Query().Get("course_id")); err == nil {
+		q.CourseID = &courseID
+	}
+	if t := r.URL.Query().Get("type"); t != "" {
+		q.Type = &t
+	}
+
+	results, err := h.repo.Query(r.Context(), q)
 	if err != nil {
 		http.Error(w, "search failed", http.StatusInternalServerError)
 		return
