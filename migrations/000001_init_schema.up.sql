@@ -57,7 +57,7 @@ CREATE TRIGGER materials_search_vector_trigger
 
 CREATE TABLE flags (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    material_id UUID NOT NULL REFERENCES materials(id),
+    material_id UUID NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
     reported_by UUID NOT NULL REFERENCES users(id),
     reason TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
