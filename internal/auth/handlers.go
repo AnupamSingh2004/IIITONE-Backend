@@ -82,5 +82,3 @@ func (h *CallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	http.Redirect(w, r, h.frontendURL, http.StatusFound)
 }
-
-func mustUUID() uuid.UUID { return uuid.New() }

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,7 +40,7 @@ type fakeUserUpserter struct {
 
 func (f *fakeUserUpserter) UpsertFromIdentity(ctx context.Context, id Identity) (UpsertedUser, error) {
 	f.upserted = id
-	return UpsertedUser{ID: mustUUID(), Role: "student", Status: "active"}, nil
+	return UpsertedUser{ID: uuid.New(), Role: "student", Status: "active"}, nil
 }
 
 func TestCallbackHandler_ValidDomain_SetsCookieAndRedirects(t *testing.T) {
