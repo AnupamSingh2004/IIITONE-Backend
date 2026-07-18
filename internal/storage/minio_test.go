@@ -29,7 +29,7 @@ func TestMinioStore_PutGetDeleteExists(t *testing.T) {
 	key := "test/hello.txt"
 	content := []byte("hello iiitone")
 
-	require.NoError(t, store.Put(ctx, key, bytes.NewReader(content), int64(len(content))))
+	require.NoError(t, store.Put(ctx, key, "text/plain", bytes.NewReader(content), int64(len(content))))
 
 	exists, err := store.Exists(ctx, key)
 	require.NoError(t, err)

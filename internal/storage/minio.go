@@ -21,6 +21,8 @@ type MinioStore struct {
 	bucket string
 }
 
+var _ Store = (*MinioStore)(nil)
+
 func NewMinioStore(cfg Config) (*MinioStore, error) {
 	client, err := minio.New(cfg.Endpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
@@ -32,11 +34,14 @@ func NewMinioStore(cfg Config) (*MinioStore, error) {
 	return &MinioStore{client: client, bucket: cfg.Bucket}, nil
 }
 
-func (s *MinioStore) Put(ctx context.Context, key string, body io.Reader, size int64) error {
-	_, err := s.client.PutObject(ctx, s.bucket, key, body, size, minio.PutObjectOptions{})
+func (s *MinioStore) Put(ctx context.Context, key, contentType string, body io.Reader, size int64) error {
+	_, err := s.client.PutObject(ctx, s.bucket, key, body, size, minio.PutObjectOptions{ContentType: contentType})
 	return err
 }
 
+// Get returns a reader for the object. minio-go's GetObject performs no
+// network I/O before returning: a nil error here does not mean the object
+// exists — a missing key surfaces as an error on the first Read() instead.
 func (s *MinioStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	return s.client.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
 }
