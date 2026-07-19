@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -36,11 +37,20 @@ func (f fakeVerifier) VerifyCode(ctx context.Context, code string) (Identity, er
 
 type fakeUserUpserter struct {
 	upserted Identity
+	err      error
+	status   string // defaults to "active" if empty
 }
 
 func (f *fakeUserUpserter) UpsertFromIdentity(ctx context.Context, id Identity) (UpsertedUser, error) {
 	f.upserted = id
-	return UpsertedUser{ID: uuid.New(), Role: "student", Status: "active"}, nil
+	if f.err != nil {
+		return UpsertedUser{}, f.err
+	}
+	status := f.status
+	if status == "" {
+		status = "active"
+	}
+	return UpsertedUser{ID: uuid.New(), Role: "student", Status: status}, nil
 }
 
 func TestCallbackHandler_ValidDomain_SetsCookieAndRedirects(t *testing.T) {
@@ -77,4 +87,64 @@ func TestCallbackHandler_WrongDomain_Rejected(t *testing.T) {
 
 	require.Equal(t, http.StatusForbidden, rec.Code)
 	require.Empty(t, rec.Result().Cookies())
+}
+
+func TestCallbackHandler_MissingCode_BadRequest(t *testing.T) {
+	verifier := fakeVerifier{}
+	users := &fakeUserUpserter{}
+	h := NewCallbackHandler(verifier, users, "iiitdmj.ac.in", "test-secret", "http://localhost:5173")
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/google/callback", nil)
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Empty(t, rec.Result().Cookies())
+}
+
+func TestCallbackHandler_VerifierError_BadGateway(t *testing.T) {
+	verifier := fakeVerifier{err: errors.New("oauth exchange failed")}
+	users := &fakeUserUpserter{}
+	h := NewCallbackHandler(verifier, users, "iiitdmj.ac.in", "test-secret", "http://localhost:5173")
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/google/callback?code=abc", nil)
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Empty(t, rec.Result().Cookies())
+}
+
+func TestCallbackHandler_UpsertError_InternalServerError(t *testing.T) {
+	verifier := fakeVerifier{identity: fakeIdentity{
+		email: "student@iiitdmj.ac.in", hd: "iiitdmj.ac.in", sub: "sub123", name: "Student One",
+	}}
+	users := &fakeUserUpserter{err: errors.New("db unavailable")}
+	h := NewCallbackHandler(verifier, users, "iiitdmj.ac.in", "test-secret", "http://localhost:5173")
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/google/callback?code=abc", nil)
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+	require.Empty(t, rec.Result().Cookies())
+}
+
+func TestCallbackHandler_BannedUser_Rejected(t *testing.T) {
+	verifier := fakeVerifier{identity: fakeIdentity{
+		email: "student@iiitdmj.ac.in", hd: "iiitdmj.ac.in", sub: "sub123", name: "Banned Student",
+	}}
+	users := &fakeUserUpserter{status: "banned"}
+	h := NewCallbackHandler(verifier, users, "iiitdmj.ac.in", "test-secret", "http://localhost:5173")
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/google/callback?code=abc", nil)
+	rec := httptest.NewRecorder()
+
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Empty(t, rec.Result().Cookies(), "a banned user must never receive a session cookie, even with a valid college domain")
 }
