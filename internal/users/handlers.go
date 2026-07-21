@@ -18,7 +18,11 @@ func NewHandlers(repo *Repository) *Handlers {
 }
 
 func (h *Handlers) Me(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.ClaimsFromContext(r.Context())
+	claims, ok := auth.ClaimsFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	profile, err := h.repo.GetProfile(r.Context(), claims.UserID)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -33,7 +37,11 @@ type updateProfileRequest struct {
 }
 
 func (h *Handlers) UpdateMe(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.ClaimsFromContext(r.Context())
+	claims, ok := auth.ClaimsFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	var req updateProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
