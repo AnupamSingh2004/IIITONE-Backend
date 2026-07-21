@@ -3,10 +3,16 @@ package users
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/AnupamSingh2004/iiitone-backend/internal/auth"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+)
+
+const (
+	minYear = 1
+	maxYear = 6
 )
 
 type Handlers struct {
@@ -45,6 +51,14 @@ func (h *Handlers) UpdateMe(w http.ResponseWriter, r *http.Request) {
 	var req updateProfileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Branch) == "" {
+		http.Error(w, "branch is required", http.StatusBadRequest)
+		return
+	}
+	if req.Year < minYear || req.Year > maxYear {
+		http.Error(w, "year must be between 1 and 6", http.StatusBadRequest)
 		return
 	}
 	if err := h.repo.UpdateProfile(r.Context(), claims.UserID, req.Branch, req.Year); err != nil {
