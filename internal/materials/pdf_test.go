@@ -34,3 +34,24 @@ func TestExtractText_NoTextLayer_DegradesGracefully(t *testing.T) {
 	require.False(t, hasLayer)
 	require.Empty(t, text)
 }
+
+func TestExtractTextFromContentStream_TJKerningBecomesWordBreak(t *testing.T) {
+	// Many PDF producers space words apart using a kerning number between TJ
+	// string operands instead of a literal space glyph in either string.
+	stream := []byte(`BT /F1 12 Tf [(Hello) -250 (World)] TJ ET`)
+
+	got := extractTextFromContentStream(stream)
+
+	require.Contains(t, got, "Hello World", "a sufficiently negative kerning number must become a word break, not be silently dropped")
+}
+
+func TestExtractTextFromContentStream_SmallKerningStaysJoined(t *testing.T) {
+	// A small kerning adjustment (e.g. tightening two letters of the same word)
+	// should NOT be treated as a word break.
+	stream := []byte(`BT /F1 12 Tf [(Wo) -20 (rld)] TJ ET`)
+
+	got := extractTextFromContentStream(stream)
+
+	require.Contains(t, got, "World")
+	require.NotContains(t, got, "Wo World", "small kerning adjustments must not be misread as a word break")
+}

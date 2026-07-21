@@ -97,13 +97,20 @@ func extractTextFromContentStream(data []byte) string {
 			lastString = ""
 			haveLastString = false
 		case "TJ":
-			for _, s := range arrayStrings {
-				out.WriteString(s)
-			}
+			out.WriteString(strings.Join(arrayStrings, ""))
 			out.WriteByte('\n')
 			arrayStrings = nil
 		}
 	}
+
+	// wordBreakKerningThreshold: a TJ array's numeric operands are kerning
+	// adjustments in thousandths of text-space units, negative values push
+	// glyphs apart. Many PDF producers encode inter-word spacing this way
+	// instead of embedding a literal space glyph — without this, adjacent
+	// strings in a TJ array would be concatenated with no separator at all
+	// ("Hello" + "World" -> "HelloWorld"). This is a fixed best-effort
+	// heuristic (no font-size tracking here), not exact spacing.
+	const wordBreakKerningThreshold = -100
 
 	i := 0
 	n := len(data)
@@ -164,7 +171,18 @@ func extractTextFromContentStream(data []byte) string {
 				i++
 				continue
 			}
-			flushOperator(string(data[start:i]))
+			token := string(data[start:i])
+			if inArray {
+				// A number here is a kerning adjustment between two TJ string
+				// operands, not a real operator — never reaches flushOperator.
+				if num, err := strconv.ParseFloat(token, 64); err == nil {
+					if num <= wordBreakKerningThreshold {
+						arrayStrings = append(arrayStrings, " ")
+					}
+					continue
+				}
+			}
+			flushOperator(token)
 		}
 	}
 
