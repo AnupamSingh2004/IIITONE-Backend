@@ -16,8 +16,20 @@ func NewHandlers(repo *Repository) *Handlers {
 
 func (h *Handlers) List(w http.ResponseWriter, r *http.Request) {
 	branch := r.URL.Query().Get("branch")
-	year, _ := strconv.Atoi(r.URL.Query().Get("year"))
-	semester, _ := strconv.Atoi(r.URL.Query().Get("semester"))
+	if branch == "" {
+		http.Error(w, "missing or invalid branch", http.StatusBadRequest)
+		return
+	}
+	year, err := strconv.Atoi(r.URL.Query().Get("year"))
+	if err != nil {
+		http.Error(w, "missing or invalid year", http.StatusBadRequest)
+		return
+	}
+	semester, err := strconv.Atoi(r.URL.Query().Get("semester"))
+	if err != nil {
+		http.Error(w, "missing or invalid semester", http.StatusBadRequest)
+		return
+	}
 
 	list, err := h.repo.List(r.Context(), branch, year, semester)
 	if err != nil {
