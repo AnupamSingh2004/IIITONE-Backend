@@ -38,7 +38,7 @@ func TestCreate_DuplicateContentHash_Rejected(t *testing.T) {
 	}
 	id, err := repo.Create(ctx, input)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = repo.Delete(context.Background(), id) })
+	t.Cleanup(func() { require.NoError(t, repo.Delete(context.Background(), id)) })
 
 	_, err = repo.Create(ctx, input)
 	require.Error(t, err, "second insert with same content_hash must fail the unique constraint")
@@ -58,7 +58,7 @@ func TestListApproved_ExcludesPending(t *testing.T) {
 		FileKey: "materials/hash2", ContentHash: "hash-for-list-test", FileSize: 100,
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = repo.Delete(context.Background(), id) })
+	t.Cleanup(func() { require.NoError(t, repo.Delete(context.Background(), id)) })
 
 	results, err := repo.ListApproved(ctx, ListFilter{CourseID: &courseID})
 	require.NoError(t, err)
@@ -92,7 +92,7 @@ func TestGetByID_ReturnsJoinedCourseName(t *testing.T) {
 		FileKey: "materials/hash-detail", ContentHash: "hash-for-detail-test", FileSize: 200,
 	})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = repo.Delete(context.Background(), id) })
+	t.Cleanup(func() { require.NoError(t, repo.Delete(context.Background(), id)) })
 	require.NoError(t, repo.Approve(ctx, id))
 
 	detail, err := repo.GetByID(ctx, id)
