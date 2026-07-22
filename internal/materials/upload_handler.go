@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 )
 
 const maxUploadSize = 50 << 20 // 50MB
+
+var validMaterialTypes = map[string]bool{"notes": true, "pyq": true, "assignment": true}
 
 type materialsRepo interface {
 	ExistsByContentHash(ctx context.Context, hash string) (bool, error)
@@ -37,16 +40,6 @@ type UploadHandler struct {
 
 func NewUploadHandler(repo materialsRepo, courses courseResolver, store storage.Store) *UploadHandler {
 	return &UploadHandler{repo: repo, courses: courses, store: store}
-}
-
-// NewUploadHandlerForTest wires a handler with no storage backend, for unit
-// tests that only exercise validation/dedup logic (storage.Store is
-// nil-safe in ServeHTTP: the Put call is skipped when store is nil). Course
-// resolution may also be nil for tests that never reach that step (e.g. the
-// non-PDF and duplicate-hash rejection tests, which both return before
-// resolveCourse is ever called).
-func NewUploadHandlerForTest(repo materialsRepo, courses courseResolver) *UploadHandler {
-	return &UploadHandler{repo: repo, courses: courses, store: nil}
 }
 
 func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -79,8 +72,11 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	hash := hex.EncodeToString(hasher.Sum(nil))
 
+	// A short/failed read leaves the unread tail of header as zero bytes,
+	// which correctly fails the magic-byte check below, so the error is
+	// safe to ignore here.
 	header := make([]byte, 5)
-	tmp.ReadAt(header, 0)
+	_, _ = tmp.ReadAt(header, 0)
 	if !IsPDF(header) {
 		http.Error(w, "only PDF files are accepted", http.StatusBadRequest)
 		return
@@ -116,21 +112,34 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	title := strings.TrimSpace(r.FormValue("title"))
+	if title == "" {
+		http.Error(w, "title is required", http.StatusBadRequest)
+		return
+	}
+	materialType := r.FormValue("type")
+	if !validMaterialTypes[materialType] {
+		http.Error(w, "type must be one of: notes, pyq, assignment", http.StatusBadRequest)
+		return
+	}
+
 	text, hasLayer, _ := ExtractText(tmp.Name())
 
 	fileKey := "materials/" + hash + ".pdf"
 	if h.store != nil {
-		if _, seekErr := tmp.Seek(0, io.SeekStart); seekErr == nil {
-			if err := h.store.Put(r.Context(), fileKey, "application/pdf", tmp, size); err != nil {
-				http.Error(w, "failed to store file", http.StatusInternalServerError)
-				return
-			}
+		if _, seekErr := tmp.Seek(0, io.SeekStart); seekErr != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		if err := h.store.Put(r.Context(), fileKey, "application/pdf", tmp, size); err != nil {
+			http.Error(w, "failed to store file", http.StatusInternalServerError)
+			return
 		}
 	}
 
 	id, err := h.repo.Create(r.Context(), CreateInput{
 		UploaderID: claims.UserID, CourseID: courseID,
-		Type: r.FormValue("type"), Title: r.FormValue("title"),
+		Type: materialType, Title: title,
 		FileKey: fileKey, ContentHash: hash, FileSize: size,
 		HasTextLayer: hasLayer, ExtractedText: text,
 	})
@@ -141,7 +150,9 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte(`{"id":"` + id.String() + `"}`))
+	json.NewEncoder(w).Encode(struct {
+		ID uuid.UUID `json:"id"`
+	}{ID: id})
 }
 
 // resolveCourse implements the two paths iiitone-web's useUploadMaterial hook
@@ -180,9 +191,4 @@ func (h *UploadHandler) resolveCourse(r *http.Request, uploaderID uuid.UUID) (uu
 	}
 
 	return h.courses.FindOrCreate(r.Context(), courseName, branch, year, semester, &uploaderID)
-}
-
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
 }

@@ -3,6 +3,8 @@ package materials
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -15,6 +17,21 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 )
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// NewUploadHandlerForTest wires a handler with no storage backend, for unit
+// tests that only exercise validation/dedup logic (storage.Store is
+// nil-safe in ServeHTTP: the Put call is skipped when store is nil). Course
+// resolution may also be nil for tests that never reach that step (e.g. the
+// non-PDF and duplicate-hash rejection tests, which both return before
+// resolveCourse is ever called).
+func NewUploadHandlerForTest(repo materialsRepo, courses courseResolver) *UploadHandler {
+	return &UploadHandler{repo: repo, courses: courses, store: nil}
+}
 
 type fakeMaterialsRepo struct {
 	existingHashes map[string]bool
