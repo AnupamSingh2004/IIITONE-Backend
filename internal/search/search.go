@@ -2,12 +2,19 @@ package search
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+)
+
+const (
+	cacheTTL  = 2 * time.Minute
+	resultCap = 50
 )
 
 type Repository struct {
@@ -58,9 +65,9 @@ func (r *Repository) Query(ctx context.Context, q Query) ([]Result, error) {
 		  AND ($2::uuid IS NULL OR m.course_id = $2)
 		  AND ($3::text IS NULL OR m.type = $3)
 		ORDER BY rank DESC
-		LIMIT 50
+		LIMIT $4
 	`
-	rows, err := r.pool.Query(ctx, sqlQuery, q.Text, q.CourseID, q.Type)
+	rows, err := r.pool.Query(ctx, sqlQuery, q.Text, q.CourseID, q.Type, resultCap)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +87,7 @@ func (r *Repository) Query(ctx context.Context, q Query) ([]Result, error) {
 
 	if r.cache != nil {
 		if data, err := json.Marshal(results); err == nil {
-			r.cache.Set(ctx, cacheKey, data, 2*time.Minute)
+			r.cache.Set(ctx, cacheKey, data, cacheTTL)
 		}
 	}
 
@@ -89,13 +96,19 @@ func (r *Repository) Query(ctx context.Context, q Query) ([]Result, error) {
 
 // cacheKeyFor must fold every filter into the key — a cache hit on text alone
 // would silently return results for the wrong course/type filter combination.
+//
+// It hashes the JSON-marshaled query rather than concatenating fields with
+// string delimiters: raw search text is user-controlled and could otherwise
+// contain a delimiter sequence (e.g. a query for the literal text
+// "foo:course=<uuid>") that collides with a genuinely filtered query for a
+// different course, serving one query's cached results to the other.
 func cacheKeyFor(q Query) string {
-	key := "search:" + q.Text
-	if q.CourseID != nil {
-		key += ":course=" + q.CourseID.String()
+	data, err := json.Marshal(q)
+	if err != nil {
+		// Unmarshalable Query (shouldn't happen — all fields are JSON-safe)
+		// just means the cache is skipped for this call, not a hard failure.
+		return ""
 	}
-	if q.Type != nil {
-		key += ":type=" + *q.Type
-	}
-	return key
+	sum := sha256.Sum256(data)
+	return "search:" + hex.EncodeToString(sum[:])
 }

@@ -18,7 +18,12 @@ func NewHandlers(repo *Repository) *Handlers {
 func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 	q := Query{Text: r.URL.Query().Get("q")}
 
-	if courseID, err := uuid.Parse(r.URL.Query().Get("course_id")); err == nil {
+	if raw := r.URL.Query().Get("course_id"); raw != "" {
+		courseID, err := uuid.Parse(raw)
+		if err != nil {
+			http.Error(w, "invalid course_id", http.StatusBadRequest)
+			return
+		}
 		q.CourseID = &courseID
 	}
 	if t := r.URL.Query().Get("type"); t != "" {
