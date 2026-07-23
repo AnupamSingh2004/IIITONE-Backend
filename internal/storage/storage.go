@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"io"
+	"time"
 )
 
 // Store abstracts object storage so implementations (MinIO locally,
@@ -16,4 +17,7 @@ type Store interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	Delete(ctx context.Context, key string) error
 	Exists(ctx context.Context, key string) (bool, error)
+	// PresignedGetURL returns a time-limited URL the client can fetch the
+	// object from directly, without proxying bytes through this server.
+	PresignedGetURL(ctx context.Context, key string, expiry time.Duration) (string, error)
 }

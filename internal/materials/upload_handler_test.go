@@ -70,6 +70,9 @@ func (f *fakeStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 }
 func (f *fakeStore) Delete(ctx context.Context, key string) error         { return nil }
 func (f *fakeStore) Exists(ctx context.Context, key string) (bool, error) { return false, nil }
+func (f *fakeStore) PresignedGetURL(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	return "", nil
+}
 
 // fakeCourseResolver matches courses.Repository.FindOrCreate's real signature.
 type fakeCourseResolver struct {

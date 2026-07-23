@@ -73,6 +73,9 @@ func New(deps Deps) http.Handler {
 		uploadHandler := materials.NewUploadHandler(matRepo, courseRepo, deps.Store)
 		api.Post("/materials", uploadHandler.ServeHTTP)
 
+		detailHandler := materials.NewDetailHandler(matRepo, deps.Store)
+		api.Get("/materials/{materialID}", detailHandler.ServeHTTP)
+
 		searchRepo := search.NewRepository(deps.Pool, deps.Cache)
 		searchHandlers := search.NewHandlers(searchRepo)
 		api.Get("/search", searchHandlers.Search)

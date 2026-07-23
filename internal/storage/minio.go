@@ -3,6 +3,8 @@ package storage
 import (
 	"context"
 	"io"
+	"net/url"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -60,4 +62,12 @@ func (s *MinioStore) Exists(ctx context.Context, key string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func (s *MinioStore) PresignedGetURL(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	u, err := s.client.PresignedGetObject(ctx, s.bucket, key, expiry, url.Values{})
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
 }

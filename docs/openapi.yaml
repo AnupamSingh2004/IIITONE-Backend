@@ -397,6 +397,61 @@ paths:
               schema:
                 type: string
 
+  /api/materials/{materialID}:
+    get:
+      tags: [materials]
+      summary: Get a material's detail (for the PDF viewer page)
+      description: >
+        Returns a material's metadata plus a time-limited presigned URL
+        (15 minute expiry) the client can fetch the underlying PDF from
+        directly, without proxying bytes through this server. Note on access
+        control: this endpoint does not filter by `status = 'approved'` or
+        check that the caller is the uploader/an admin — any authenticated
+        user who knows a material's ID (an unguessable UUID) can view its
+        detail and get a download URL, including for a still-pending
+        material. This matches the existing trust model elsewhere in this
+        API (e.g. none of the `/api/admin/*` moderation endpoints check
+        "is this admin's own material" either) — `RequireAuth` being the
+        perimeter and IDs being opaque is the established pattern, not a
+        gap specific to this route.
+      operationId: getMaterialDetail
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: materialID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The material's detail, including a freshly-signed fileUrl.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MaterialDetail"
+        "400":
+          description: "`materialID` is not a valid UUID (\"invalid id\")."
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No material found with the given ID ("not found").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Presigned URL generation failed ("failed to generate file url").
+          content:
+            text/plain:
+              schema:
+                type: string
+
   /api/search:
     get:
       tags: [search]
@@ -864,6 +919,29 @@ components:
         reason:
           type: string
       required: [material_id, reason]
+
+    MaterialDetail:
+      type: object
+      description: >
+        Response shape of GET /api/materials/{materialID}
+        (internal/materials/detail_handler.go detailResponse). fileUrl is a
+        presigned storage URL generated per-request, not a stored value.
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        type:
+          type: string
+          enum: [notes, pyq, assignment]
+        courseName:
+          type: string
+        fileUrl:
+          type: string
+          format: uri
+          description: Presigned URL to fetch the PDF directly from storage. Expires 15 minutes after issuance.
+      required: [id, title, type, courseName, fileUrl]
 
     PendingSummary:
       type: object
