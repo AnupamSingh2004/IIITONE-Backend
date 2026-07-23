@@ -3,6 +3,7 @@ package moderation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/AnupamSingh2004/iiitone-backend/internal/auth"
@@ -11,6 +12,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
+
+// errMaterialNotFound distinguishes "there was nothing to delete" (a no-op
+// for callers like ResolveFlag that tolerate an already-gone material) from
+// a genuine delete failure, which must not be silently swallowed.
+var errMaterialNotFound = errors.New("material not found")
 
 type Handlers struct {
 	materials *materials.Repository
@@ -52,23 +58,30 @@ func (h *Handlers) Reject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
-	h.rejectAndDelete(r.Context(), w, id)
+	if err := h.deleteMaterial(r.Context(), id); err != nil {
+		if errors.Is(err, errMaterialNotFound) {
+			http.Error(w, "not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "delete failed", http.StatusInternalServerError)
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
-func (h *Handlers) rejectAndDelete(ctx context.Context, w http.ResponseWriter, id uuid.UUID) {
+// deleteMaterial best-effort deletes the storage object, then hard-deletes
+// the material row (the source of truth — see rejectAndDelete/ResolveFlag,
+// both of which route through this single implementation so their
+// not-found/failure semantics can't drift apart from each other).
+func (h *Handlers) deleteMaterial(ctx context.Context, id uuid.UUID) error {
 	fileKey, err := h.materials.GetFileKey(ctx, id)
 	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
+		return errMaterialNotFound
 	}
 	if h.store != nil {
 		_ = h.store.Delete(ctx, fileKey) // best-effort; row delete below is the source of truth
 	}
-	if err := h.materials.Delete(ctx, id); err != nil {
-		http.Error(w, "delete failed", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	return h.materials.Delete(ctx, id)
 }
 
 type createFlagRequest struct {
@@ -77,7 +90,11 @@ type createFlagRequest struct {
 }
 
 func (h *Handlers) CreateFlag(w http.ResponseWriter, r *http.Request) {
-	claims, _ := auth.ClaimsFromContext(r.Context())
+	claims, ok := auth.ClaimsFromContext(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	var req createFlagRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
@@ -120,12 +137,14 @@ func (h *Handlers) ResolveFlag(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid material_id", http.StatusBadRequest)
 			return
 		}
-		fileKey, err := h.materials.GetFileKey(r.Context(), materialID)
-		if err == nil {
-			if h.store != nil {
-				_ = h.store.Delete(r.Context(), fileKey)
-			}
-			_ = h.materials.Delete(r.Context(), materialID)
+		// A material that's already gone (e.g. resolved twice, or removed
+		// via a separate reject call) is a no-op, not an error. A genuine
+		// delete failure after the material was found must surface as an
+		// error rather than proceed to resolve the flag — otherwise the
+		// admin sees "resolved" while the flagged content is still live.
+		if err := h.deleteMaterial(r.Context(), materialID); err != nil && !errors.Is(err, errMaterialNotFound) {
+			http.Error(w, "delete failed", http.StatusInternalServerError)
+			return
 		}
 	}
 
