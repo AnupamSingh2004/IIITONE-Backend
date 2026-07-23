@@ -107,23 +107,36 @@ func (r *Repository) ListApproved(ctx context.Context, f ListFilter) ([]Material
 	return list, rows.Err()
 }
 
-func (r *Repository) ListPending(ctx context.Context) ([]Material, error) {
+// PendingSummary matches the frontend's admin pending-queue shape exactly
+// (see iiitone-web's src/app/app/admin/pending/page.tsx's PendingMaterial
+// interface) so the queue can render a row with no second round-trip.
+type PendingSummary struct {
+	ID         uuid.UUID `json:"id"`
+	Title      string    `json:"title"`
+	Type       string    `json:"type"`
+	CourseName string    `json:"courseName"`
+}
+
+func (r *Repository) ListPending(ctx context.Context) ([]PendingSummary, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, uploader_id, course_id, type, title, file_key, has_text_layer, status
-		FROM materials WHERE status = 'pending' ORDER BY created_at ASC
+		SELECT m.id, m.title, m.type, c.name
+		FROM materials m
+		JOIN courses c ON c.id = m.course_id
+		WHERE m.status = 'pending'
+		ORDER BY m.created_at ASC
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	list := []Material{}
+	list := []PendingSummary{}
 	for rows.Next() {
-		var m Material
-		if err := rows.Scan(&m.ID, &m.UploaderID, &m.CourseID, &m.Type, &m.Title, &m.FileKey, &m.HasTextLayer, &m.Status); err != nil {
+		var s PendingSummary
+		if err := rows.Scan(&s.ID, &s.Title, &s.Type, &s.CourseName); err != nil {
 			return nil, err
 		}
-		list = append(list, m)
+		list = append(list, s)
 	}
 	return list, rows.Err()
 }
