@@ -2829,24 +2829,37 @@ func (r *FlagsRepository) Create(ctx context.Context, materialID, reportedBy uui
 	return id, err
 }
 
+// Flag matches the frontend's admin flags-queue shape exactly (see
+// iiitone-web's src/app/app/admin/flags/page.tsx's OpenFlag interface).
+// Note UploaderID here is the flagged MATERIAL's uploader (materials.uploader_id
+// — the person the "Ban uploader" button acts on), NOT flags.reported_by (the
+// person who filed the report, which the frontend never displays or uses).
+// This requires a JOIN to materials, not a plain SELECT off flags.
 type Flag struct {
-	ID         uuid.UUID
-	MaterialID uuid.UUID
-	ReportedBy uuid.UUID
-	Reason     string
+	ID            uuid.UUID `json:"id"`
+	MaterialID    uuid.UUID `json:"materialId"`
+	MaterialTitle string    `json:"materialTitle"`
+	UploaderID    uuid.UUID `json:"uploaderId"`
+	Reason        string    `json:"reason"`
 }
 
 func (r *FlagsRepository) ListOpen(ctx context.Context) ([]Flag, error) {
-	rows, err := r.pool.Query(ctx, `SELECT id, material_id, reported_by, reason FROM flags WHERE status = 'open' ORDER BY created_at ASC`)
+	rows, err := r.pool.Query(ctx, `
+		SELECT f.id, f.material_id, m.title, m.uploader_id, f.reason
+		FROM flags f
+		JOIN materials m ON m.id = f.material_id
+		WHERE f.status = 'open'
+		ORDER BY f.created_at ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var list []Flag
+	list := []Flag{}
 	for rows.Next() {
 		var f Flag
-		if err := rows.Scan(&f.ID, &f.MaterialID, &f.ReportedBy, &f.Reason); err != nil {
+		if err := rows.Scan(&f.ID, &f.MaterialID, &f.MaterialTitle, &f.UploaderID, &f.Reason); err != nil {
 			return nil, err
 		}
 		list = append(list, f)
@@ -2864,6 +2877,58 @@ func (r *FlagsRepository) Resolve(ctx context.Context, id uuid.UUID) error {
 
 Run: `source .env && go test ./internal/moderation/... -v`
 Expected: PASS
+
+- [ ] **Step 4.5: Add a JSON-shaped pending-queue query to `internal/materials/repository.go`**
+
+`materials.Material` deliberately has no JSON tags (see the comment above its
+definition) and `ListPending`'s current `SELECT` doesn't join `courses`, so
+serializing `[]Material` directly would produce PascalCase fields and no
+`courseName` at all — a mismatch with the frontend's `PendingMaterial`
+interface (`src/app/app/admin/pending/page.tsx`: `{id, title, type, courseName}`).
+Add a dedicated response type and change `ListPending` to join courses and
+return it, instead of `[]Material`:
+
+```go
+// internal/materials/repository.go — add this type and replace ListPending's
+// body/signature with this version.
+
+// PendingSummary matches the frontend's admin pending-queue shape exactly
+// (see iiitone-web's src/app/app/admin/pending/page.tsx's PendingMaterial
+// interface) so the queue can render a row with no second round-trip.
+type PendingSummary struct {
+	ID         uuid.UUID `json:"id"`
+	Title      string    `json:"title"`
+	Type       string    `json:"type"`
+	CourseName string    `json:"courseName"`
+}
+
+func (r *Repository) ListPending(ctx context.Context) ([]PendingSummary, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT m.id, m.title, m.type, c.name
+		FROM materials m
+		JOIN courses c ON c.id = m.course_id
+		WHERE m.status = 'pending'
+		ORDER BY m.created_at ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	list := []PendingSummary{}
+	for rows.Next() {
+		var s PendingSummary
+		if err := rows.Scan(&s.ID, &s.Title, &s.Type, &s.CourseName); err != nil {
+			return nil, err
+		}
+		list = append(list, s)
+	}
+	return list, rows.Err()
+}
+```
+
+`ListPending` was not yet used or tested anywhere before this task, so this
+signature change is safe — nothing else in the codebase calls it.
 
 - [ ] **Step 5: Implement HTTP handlers wiring materials + flags + users + storage together**
 
