@@ -46,6 +46,12 @@ func NewGoogleVerifier(ctx context.Context, clientID, clientSecret, redirectURL 
 	}, nil
 }
 
+// LoginURL returns the Google OAuth consent-screen URL for the given
+// anti-CSRF state value.
+func (g *GoogleVerifier) LoginURL(state string) string {
+	return g.oauthConfig.AuthCodeURL(state)
+}
+
 func (g *GoogleVerifier) VerifyCode(ctx context.Context, code string) (Identity, error) {
 	token, err := g.oauthConfig.Exchange(ctx, code)
 	if err != nil {
