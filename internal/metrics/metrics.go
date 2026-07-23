@@ -34,6 +34,14 @@ func New() *Metrics {
 
 // Middleware wraps next, recording a request counter labeled by path,
 // method, and response status text after the request completes.
+//
+// TODO(task-19): r.URL.Path is the raw request path, not the matched route
+// pattern. Once this is wired to routes with path parameters (e.g.
+// /api/materials/{id}), every distinct ID ever requested becomes its own
+// permanent time series in http_requests_total — unbounded cardinality
+// growth. Replace with the router's matched route pattern (chi exposes this
+// via chi.RouteContext(r.Context()).RoutePattern()) before wiring this
+// middleware to parameterized routes.
 func (m *Metrics) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
