@@ -85,3 +85,7 @@ erDiagram
 - Additional indexes: `materials_course_idx` on `materials(course_id)`, and
   `courses_lookup_idx` on `courses(branch, year, semester)` (backing `GET
   /api/courses`'s filter).
+- **`courses.created_by` is nullable** because it's only populated for
+  courses created via the on-the-fly resolution path during material upload
+  (`courses.Repository.FindOrCreate` is passed the uploader's ID); it's null
+  for any course that predates that flow (e.g. seeded directly).

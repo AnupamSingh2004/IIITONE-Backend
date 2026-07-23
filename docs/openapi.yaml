@@ -11,6 +11,13 @@ info:
     `internal/router/router.go` and the request/response shapes implemented
     by each handler — see that file and each package's `handlers.go` /
     `repository.go` for the source of truth.
+
+
+    Note on casing: request bodies and multipart form fields use snake_case
+    (e.g. `material_id`, `course_id`), while response bodies use camelCase
+    (e.g. `materialId`, `courseName`). This is an existing inconsistency in
+    the implementation, not a typo in this spec — don't mirror a response
+    shape back as a request body without checking.
   version: "1.0.0"
 servers:
   - url: /
@@ -520,7 +527,10 @@ paths:
             format: uuid
       responses:
         "204":
-          description: Material approved.
+          description: >-
+            Material approved. Note: unlike reject, this endpoint does not
+            verify the material exists first — approving a nonexistent
+            `materialID` still returns 204 with no effect, not 404.
         "400":
           description: "`materialID` is not a valid UUID (\"invalid id\")."
           content:
