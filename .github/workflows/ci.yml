@@ -32,7 +32,8 @@ jobs:
       - name: Run migrations
         run: |
           go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
-          migrate -path ./migrations -database "postgres://iiitone:iiitone@localhost:5432/iiitone?sslmode=disable" up
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/migrate" -path ./migrations -database "postgres://iiitone:iiitone@localhost:5432/iiitone?sslmode=disable" up
       - name: Test
         env:
           DATABASE_URL: postgres://iiitone:iiitone@localhost:5432/iiitone?sslmode=disable
