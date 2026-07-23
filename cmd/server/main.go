@@ -30,6 +30,7 @@ func main() {
 	defer pool.Close()
 
 	cache := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	defer cache.Close()
 
 	store, err := storage.NewMinioStore(storage.Config{
 		Endpoint: cfg.StorageEndpoint, AccessKey: cfg.StorageAccessKey,
