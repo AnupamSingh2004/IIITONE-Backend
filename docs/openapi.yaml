@@ -1,0 +1,894 @@
+openapi: 3.0.3
+info:
+  title: IIITOne Backend API
+  description: >
+    API for IIITOne, a study-materials sharing platform for a verified college
+    community. Authentication is via Google OAuth; session state is carried in
+    an httpOnly `session` cookie (a JWT) set by the OAuth callback.
+
+
+    This spec is derived directly from the wired routes in
+    `internal/router/router.go` and the request/response shapes implemented
+    by each handler — see that file and each package's `handlers.go` /
+    `repository.go` for the source of truth.
+  version: "1.0.0"
+servers:
+  - url: /
+    description: Same-origin (the frontend and API are served from the same host)
+
+security: []
+
+tags:
+  - name: system
+    description: Health and observability endpoints (unauthenticated)
+  - name: auth
+    description: Google OAuth login/callback flow
+  - name: users
+    description: The current user's profile, and admin user moderation
+  - name: courses
+    description: Course catalog lookups
+  - name: materials
+    description: Study material upload and browsing
+  - name: search
+    description: Full-text search over approved materials
+  - name: moderation
+    description: Content flags and the admin moderation queue
+
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      summary: Liveness check
+      description: Always returns 200 with an empty body. No authentication required.
+      operationId: healthz
+      responses:
+        "200":
+          description: Service is up.
+
+  /metrics:
+    get:
+      tags: [system]
+      summary: Prometheus metrics
+      description: >
+        Exposes collected metrics (currently `http_requests_total`, a counter
+        labeled by `path`, `method`, `status`) in the Prometheus text
+        exposition format. This is plain text, not JSON. No authentication
+        required.
+      operationId: metrics
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content:
+            text/plain; version=0.0.4; charset=utf-8:
+              schema:
+                type: string
+              example: |
+                # HELP http_requests_total Total HTTP requests
+                # TYPE http_requests_total counter
+                http_requests_total{method="GET",path="/healthz",status="OK"} 1
+
+  /auth/google/login:
+    get:
+      tags: [auth]
+      summary: Start the Google OAuth login flow
+      description: >
+        Generates a random anti-CSRF `state` value, stores it in a short-lived
+        `oauth_state` cookie (path `/auth/google`, 5 minute TTL), and redirects
+        the browser to Google's OAuth consent screen. No request body or query
+        parameters.
+      operationId: authGoogleLogin
+      responses:
+        "302":
+          description: Redirect to Google's OAuth consent screen.
+          headers:
+            Location:
+              description: Google's OAuth authorization URL.
+              schema:
+                type: string
+                format: uri
+            Set-Cookie:
+              description: >
+                Sets `oauth_state` (httpOnly, SameSite=Lax, 5 minute MaxAge,
+                path `/auth/google`).
+              schema:
+                type: string
+        "500":
+          description: Failed to generate the random state value ("failed to start login").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /auth/google/callback:
+    get:
+      tags: [auth]
+      summary: Google OAuth callback
+      description: >
+        Handles Google's redirect back with an authorization `code`. Verifies
+        the `state` query param matches the `oauth_state` cookie set by
+        `/auth/google/login`, exchanges the code for an identity, verifies the
+        identity belongs to the configured college domain and is not banned,
+        upserts the user, issues a session JWT, sets it as the httpOnly
+        `session` cookie (path `/`, 7 day MaxAge), and redirects to the
+        frontend.
+      operationId: authGoogleCallback
+      parameters:
+        - name: code
+          in: query
+          required: true
+          description: OAuth authorization code issued by Google.
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          description: Anti-CSRF state value; must match the `oauth_state` cookie.
+          schema:
+            type: string
+      responses:
+        "302":
+          description: >
+            Success: identity verified, session established, redirect to the
+            configured frontend URL.
+          headers:
+            Location:
+              description: The configured frontend URL.
+              schema:
+                type: string
+                format: uri
+            Set-Cookie:
+              description: >
+                Sets `session` (httpOnly, SameSite=Lax, 7 day MaxAge, path `/`)
+                to a signed JWT. Also clears the `oauth_state` cookie.
+              schema:
+                type: string
+        "400":
+          description: >
+            `code` query param missing, or `state` is missing/empty/does not
+            match the `oauth_state` cookie ("missing code" / "invalid oauth state").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          description: >
+            The verified identity is not a college account for the configured
+            domain ("account is not a verified college account"), or the
+            corresponding user's status is `banned` ("account is banned").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: >
+            Failed to upsert the user ("failed to create session"), or failed
+            to issue the session JWT ("failed to issue session").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "502":
+          description: >
+            The authorization code could not be verified/exchanged with Google
+            ("oauth verification failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/me:
+    get:
+      tags: [users]
+      summary: Get the current user's profile
+      operationId: getMe
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: The authenticated user's profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Profile"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No user row found for the authenticated session's user ID ("not found").
+          content:
+            text/plain:
+              schema:
+                type: string
+    patch:
+      tags: [users]
+      summary: Update the current user's profile
+      description: Sets the authenticated user's branch and year.
+      operationId: updateMe
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProfileRequest"
+      responses:
+        "204":
+          description: Profile updated.
+        "400":
+          description: >
+            Request body is not valid JSON ("invalid body"), `branch` is empty/
+            whitespace-only ("branch is required"), or `year` is outside 1..6
+            ("year must be between 1 and 6").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Database update failed ("update failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/courses:
+    get:
+      tags: [courses]
+      summary: List courses matching branch/year/semester
+      description: All three query parameters are required.
+      operationId: listCourses
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: branch
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: year
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: semester
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Courses matching the given branch/year/semester, ordered by name.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Course"
+        "400":
+          description: >
+            `branch` missing ("missing or invalid branch"), or `year`/`semester`
+            missing or not a valid integer ("missing or invalid year" /
+            "missing or invalid semester").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Database query failed ("query failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/materials:
+    post:
+      tags: [materials]
+      summary: Upload a material (PDF)
+      description: >
+        Uploads a PDF study material. The course is resolved either by
+        `course_id` (an existing course) or by `course_name` + `branch` +
+        `year` + `semester` (find-or-create). Duplicate files are rejected by
+        content hash (SHA-256). Text is extracted from the PDF when possible
+        for search indexing.
+      operationId: uploadMaterial
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+                - title
+                - type
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The PDF file (max 50MB). Must start with the PDF magic bytes.
+                title:
+                  type: string
+                  description: Material title. Required, trimmed, must be non-empty.
+                type:
+                  type: string
+                  enum: [notes, pyq, assignment]
+                course_id:
+                  type: string
+                  format: uuid
+                  description: >
+                    ID of an existing course. Takes precedence over
+                    course_name/branch/year/semester if present.
+                course_name:
+                  type: string
+                  description: >
+                    Required (with branch/year/semester) if course_id is not
+                    given — resolves via find-or-create.
+                branch:
+                  type: string
+                  description: Required if course_name is used instead of course_id.
+                year:
+                  type: integer
+                  description: Required (valid integer) if course_name is used instead of course_id.
+                semester:
+                  type: integer
+                  description: Required (valid integer) if course_name is used instead of course_id.
+            encoding:
+              file:
+                contentType: application/pdf
+      responses:
+        "201":
+          description: Material created (status starts as `pending`, awaiting admin approval).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                required: [id]
+        "400":
+          description: >
+            One of: form too large or invalid ("file too large or invalid
+            form"), missing file part ("missing file"), file is not a PDF
+            ("only PDF files are accepted"), course resolution failed
+            (invalid course_id / missing course_name+branch / invalid or
+            missing year or semester / "course resolution is not available"),
+            missing title ("title is required"), or invalid/missing type
+            ("type must be one of: notes, pyq, assignment").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          description: >
+            No valid session (checked after the PDF/dedup checks, so those
+            checks run even for anonymous requests before this is returned)
+            ("unauthorized").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "409":
+          description: A material with identical file content (same SHA-256 hash) already exists ("this file has already been uploaded").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: >
+            Server-side failure: temp file creation, reading the upload,
+            storage write, or the database insert ("server error" / "failed
+            to read upload" / "failed to store file" / "failed to save material").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/search:
+    get:
+      tags: [search]
+      summary: Full-text search over approved materials
+      operationId: search
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Search text (plainto_tsquery English full-text search).
+          schema:
+            type: string
+        - name: course_id
+          in: query
+          required: false
+          description: Restrict results to a single course.
+          schema:
+            type: string
+            format: uuid
+        - name: type
+          in: query
+          required: false
+          description: Restrict results to a material type.
+          schema:
+            type: string
+            enum: [notes, pyq, assignment]
+      responses:
+        "200":
+          description: Matching materials (status=approved only), ranked by relevance, capped at 50 results. Results may be served from a short-lived cache.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SearchResult"
+        "400":
+          description: "`course_id` is not a valid UUID (\"invalid course_id\")."
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Database query failed ("search failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/flags:
+    post:
+      tags: [moderation]
+      summary: Flag a material for moderation review
+      operationId: createFlag
+      security:
+        - cookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateFlagRequest"
+      responses:
+        "201":
+          description: Flag created (status starts as `open`). Empty body.
+        "400":
+          description: >
+            Request body is not valid JSON ("invalid body"), or `material_id`
+            is not a valid UUID ("invalid material_id").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Database insert failed ("failed to create flag").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/admin/materials/pending:
+    get:
+      tags: [moderation]
+      summary: List materials pending approval
+      description: Admin only. Ordered oldest-first.
+      operationId: listPendingMaterials
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Pending materials, oldest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PendingSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Database query failed ("query failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/admin/materials/{materialID}/approve:
+    post:
+      tags: [moderation]
+      summary: Approve a pending material
+      description: Admin only. Sets the material's status to `approved`.
+      operationId: approveMaterial
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: materialID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Material approved.
+        "400":
+          description: "`materialID` is not a valid UUID (\"invalid id\")."
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Database update failed ("approve failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/admin/materials/{materialID}/reject:
+    post:
+      tags: [moderation]
+      summary: Reject a pending material
+      description: >
+        Admin only. Rejection is a hard delete: removes the storage object
+        (best-effort) and the database row (materials.status has no
+        `rejected` value — this is intentional, per the schema). This also
+        frees the material's content_hash for resubmission and cascades to
+        delete any open flags on it.
+      operationId: rejectMaterial
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: materialID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Material rejected and deleted.
+        "400":
+          description: "`materialID` is not a valid UUID (\"invalid id\")."
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No material found with the given ID ("not found").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Delete failed ("delete failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/admin/flags:
+    get:
+      tags: [moderation]
+      summary: List open flags
+      description: Admin only. Ordered oldest-first.
+      operationId: listOpenFlags
+      security:
+        - cookieAuth: []
+      responses:
+        "200":
+          description: Open flags, oldest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Flag"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Database query failed ("query failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/admin/flags/{flagID}/resolve:
+    post:
+      tags: [moderation]
+      summary: Resolve a flag
+      description: >
+        Admin only. Marks the flag as `resolved`. If `material_id` is given,
+        the flagged material is also hard-deleted first (best-effort storage
+        delete + database delete); if that material was already gone, this is
+        treated as a no-op, not an error. Banning the uploader (if desired) is
+        a separate call to the ban endpoint — not implied by resolving a flag.
+      operationId: resolveFlag
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: flagID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: material_id
+          in: query
+          required: false
+          description: If given, hard-deletes this material before resolving the flag.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Flag resolved (and material deleted, if material_id was given).
+        "400":
+          description: >
+            `flagID` is not a valid UUID ("invalid id"), or `material_id` is
+            given but not a valid UUID ("invalid material_id").
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Material delete failed ("delete failed"), or the flag update failed ("resolve failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/admin/users/{userID}/ban:
+    post:
+      tags: [users]
+      summary: Ban a user
+      description: Admin only. Sets the user's status to `banned`.
+      operationId: banUser
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: userID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: User banned.
+        "400":
+          description: "`userID` is not a valid UUID (\"invalid user id\")."
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Database update failed ("update failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/admin/users/{userID}/unban:
+    post:
+      tags: [users]
+      summary: Unban a user
+      description: Admin only. Sets the user's status back to `active`.
+      operationId: unbanUser
+      security:
+        - cookieAuth: []
+      parameters:
+        - name: userID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: User unbanned.
+        "400":
+          description: "`userID` is not a valid UUID (\"invalid user id\")."
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Database update failed ("update failed").
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: session
+      description: >
+        Session JWT set as an httpOnly cookie by `GET /auth/google/callback`
+        on successful login. Verified by the `RequireAuth` middleware, which
+        wraps every route under `/api/*` (see internal/router/router.go).
+        Routes under `/api/admin/*` additionally require the authenticated
+        user's role claim to be `admin` (enforced by the `RequireAdmin`
+        middleware, layered on top of `RequireAuth`); OpenAPI's security
+        schemes can't natively express that second "cookie present AND
+        role==admin" condition, so admin-only routes are marked with a 403
+        response and a note in their description instead of a distinct
+        security scheme.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid `session` cookie ("unauthorized").
+      content:
+        text/plain:
+          schema:
+            type: string
+    Forbidden:
+      description: Valid session, but the user's role is not `admin` ("forbidden").
+      content:
+        text/plain:
+          schema:
+            type: string
+
+  schemas:
+    Profile:
+      type: object
+      description: Response shape of GET /api/me (internal/users/repository.go Profile).
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        name:
+          type: string
+        branch:
+          type: string
+          nullable: true
+          description: Omitted from the JSON response entirely when unset (omitempty).
+        year:
+          type: integer
+          nullable: true
+          description: Omitted from the JSON response entirely when unset (omitempty).
+        role:
+          type: string
+          enum: [student, admin]
+      required: [id, email, name, role]
+
+    UpdateProfileRequest:
+      type: object
+      description: Request body of PATCH /api/me (internal/users/handlers.go updateProfileRequest).
+      properties:
+        branch:
+          type: string
+        year:
+          type: integer
+          minimum: 1
+          maximum: 6
+      required: [branch, year]
+
+    Course:
+      type: object
+      description: Element of the GET /api/courses response array (internal/courses/repository.go Course).
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+          nullable: true
+          description: Omitted from the JSON response entirely when unset (omitempty).
+        name:
+          type: string
+        branch:
+          type: string
+        year:
+          type: integer
+        semester:
+          type: integer
+      required: [id, name, branch, year, semester]
+
+    SearchResult:
+      type: object
+      description: Element of the GET /api/search response array (internal/search/search.go Result).
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        type:
+          type: string
+          enum: [notes, pyq, assignment]
+        courseName:
+          type: string
+        hasTextLayer:
+          type: boolean
+        rank:
+          type: number
+          format: double
+          description: Full-text search relevance rank (ts_rank); higher is more relevant.
+      required: [id, title, type, courseName, hasTextLayer, rank]
+
+    CreateFlagRequest:
+      type: object
+      description: Request body of POST /api/flags (internal/moderation/handlers.go createFlagRequest).
+      properties:
+        material_id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+      required: [material_id, reason]
+
+    PendingSummary:
+      type: object
+      description: Element of the GET /api/admin/materials/pending response array (internal/materials/repository.go PendingSummary).
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        type:
+          type: string
+          enum: [notes, pyq, assignment]
+        courseName:
+          type: string
+      required: [id, title, type, courseName]
+
+    Flag:
+      type: object
+      description: >
+        Element of the GET /api/admin/flags response array (internal/moderation/flags_repository.go Flag).
+        uploaderId is the flagged MATERIAL's uploader, not the reporter.
+      properties:
+        id:
+          type: string
+          format: uuid
+        materialId:
+          type: string
+          format: uuid
+        materialTitle:
+          type: string
+        uploaderId:
+          type: string
+          format: uuid
+          description: The ID of the user who uploaded the flagged material (not the reporter).
+        reason:
+          type: string
+      required: [id, materialId, materialTitle, uploaderId, reason]
