@@ -3747,6 +3747,17 @@ git commit -m "Add OpenAPI spec and ER diagram documentation"
 **Files:**
 - Create: `.github/workflows/ci.yml`
 
+**PRE-FIX NOTE:** the plan's originally drafted workflow pinned `go-version:
+"1.22"`, but `go.mod` requires `go 1.26.2` (bumped during earlier tasks for
+language/stdlib features the codebase actually uses). Building under an
+1.22 toolchain would either fail outright or silently trigger Go's
+automatic toolchain-download mechanism (`GOTOOLCHAIN=auto`) to fetch 1.26.2
+anyway — wasteful and fragile to depend on implicitly. Pin the CI toolchain
+to match `go.mod` directly. Also added a `gofmt -l .` check (this repo has
+consistently been kept `gofmt`-clean across every prior task; catching a
+regression in CI is cheap and matches the frontend repo's CI running
+`lint` as a fast pre-build check).
+
 - [ ] **Step 1: Write the workflow**
 
 ```yaml
@@ -3777,7 +3788,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.26.2"
+      - run: gofmt -l . | tee /tmp/fmt-out; test ! -s /tmp/fmt-out
       - run: go build ./...
       - run: go vet ./...
       - name: Run migrations
@@ -3789,6 +3801,13 @@ jobs:
           DATABASE_URL: postgres://iiitone:iiitone@localhost:5432/iiitone?sslmode=disable
         run: go test ./... -v
 ```
+
+(Note: `REDIS_ADDR`/`STORAGE_ENDPOINT` are deliberately left unset in CI —
+the search package's cache-path test and the storage/minio test both skip
+cleanly without them, per their own `t.Skip`/early-return guards. Standing
+up Redis/MinIO service containers here would be extra CI complexity for
+coverage this plan doesn't require; the DB-backed integration tests are the
+ones that matter for this workflow.)
 
 - [ ] **Step 2: Commit**
 
