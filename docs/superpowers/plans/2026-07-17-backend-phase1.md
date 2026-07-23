@@ -3272,6 +3272,43 @@ func TestRouter_HealthCheckIsPublic(t *testing.T) {
 Run: `go test ./internal/router/... -v`
 Expected: FAIL — package undefined.
 
+**PRE-FIX NOTE (applied before implementation, read this before Step 3):** the
+snippets originally drafted for this task had three real bugs, caught by
+cross-checking against the actual state of already-completed packages:
+
+1. `materials.NewUploadHandler(matRepo, deps.Store)` is a **2-argument call
+   to a 3-argument function** — `internal/materials/upload_handler.go`'s real
+   signature (fixed during Task 15's review) is
+   `NewUploadHandler(repo materialsRepo, courses courseResolver, store storage.Store)`.
+   The router as originally drafted would not compile. Step 3 below now
+   constructs a `courseRepo` and passes it.
+2. **There was no `/auth/google/login` route or handler anywhere in the
+   codebase.** `internal/auth` only has a callback handler — nothing
+   generates the redirect to Google's consent screen. The frontend's landing
+   page (`iiitone-web/src/app/page.tsx`) already redirects to
+   `${API_URL}/auth/google/login`; without this route, login is completely
+   broken (404), which defeats the point of this task's own Step 6
+   smoke-test. Step 3.5 below adds a `LoginHandler` (with anti-CSRF OAuth
+   `state`, since this is the first point the login flow is actually wired
+   end-to-end and skipping `state` is a known, cheap-to-avoid vulnerability
+   class for OAuth login flows).
+3. `CallbackHandler`'s session cookie hardcodes `Secure: true`
+   (`internal/auth/handlers.go`). This makes the cookie unusable in local
+   dev, where the backend runs over plain `http://localhost:8080` (per this
+   very task's Step 6 smoke test, and per `docker-compose.yml`) — Secure
+   cookies require an HTTPS transport. `internal/config.Config` already has
+   an `Env` field (default `"development"`) for exactly this kind of
+   environment-gated behavior. Step 3.5 threads a `cookieSecure bool`
+   through both the login and callback handlers, computed in `main.go` from
+   `cfg.Env == "production"`.
+
+Also fixed as part of this pre-fix pass, outside the Go code: `.env` and
+`.env.example`'s `FRONTEND_URL` was still `http://localhost:5173` (Vite's
+default port, left over from before the frontend repo switched to Next.js
+mid-project) instead of Next.js's `http://localhost:3000` — the OAuth
+callback would have redirected a successful login to a dead port. Already
+corrected in both files.
+
 - [ ] **Step 3: Implement the router composition root**
 
 ```go
@@ -3299,12 +3336,13 @@ import (
 // handlers that need a DB pool are exercised in their own package's tests, not here;
 // this router test suite only checks routing/auth-gating shape.
 type Deps struct {
-	JWTSecret     string
-	Pool          *pgxpool.Pool
-	Cache         *redis.Client
-	Store         storage.Store
-	AuthCallback  http.Handler
-	FrontendURL   string
+	JWTSecret    string
+	Pool         *pgxpool.Pool
+	Cache        *redis.Client
+	Store        storage.Store
+	AuthLogin    http.Handler
+	AuthCallback http.Handler
+	FrontendURL  string
 }
 
 func New(deps Deps) http.Handler {
@@ -3317,6 +3355,9 @@ func New(deps Deps) http.Handler {
 	r.Get("/metrics", m.Handler().ServeHTTP)
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 
+	if deps.AuthLogin != nil {
+		r.Get("/auth/google/login", deps.AuthLogin.ServeHTTP)
+	}
 	if deps.AuthCallback != nil {
 		r.Get("/auth/google/callback", deps.AuthCallback.ServeHTTP)
 	}
@@ -3335,7 +3376,7 @@ func New(deps Deps) http.Handler {
 			api.Get("/courses", courseHandlers.List)
 
 			matRepo := materials.NewRepository(deps.Pool)
-			uploadHandler := materials.NewUploadHandler(matRepo, deps.Store)
+			uploadHandler := materials.NewUploadHandler(matRepo, courseRepo, deps.Store)
 			api.Post("/materials", uploadHandler.ServeHTTP)
 
 			searchRepo := search.NewRepository(deps.Pool, deps.Cache)
@@ -3363,10 +3404,224 @@ func New(deps Deps) http.Handler {
 }
 ```
 
+- [ ] **Step 3.5: Add the login-initiation handler and thread `cookieSecure` through the OAuth handlers**
+
+`internal/materials.NewUploadHandler`'s real (already-implemented) signature
+takes a `courseResolver` as its second argument — `courses.Repository`
+already satisfies that interface (`FindOrCreate(ctx, name, branch string,
+year, semester int, createdBy *uuid.UUID) (uuid.UUID, error)`), which is why
+Step 3 above passes `courseRepo` there; no change needed in
+`internal/courses`.
+
+Add a `LoginURL` method to `GoogleVerifier` in `internal/auth/oauth.go`:
+
+```go
+// LoginURL returns the Google OAuth consent-screen URL for the given
+// anti-CSRF state value.
+func (g *GoogleVerifier) LoginURL(state string) string {
+	return g.oauthConfig.AuthCodeURL(state)
+}
+```
+
+Rewrite `internal/auth/handlers.go` to add `LoginHandler` and thread
+`cookieSecure` through both handlers, with an OAuth `state` cookie the
+callback validates:
+
+```go
+// internal/auth/handlers.go
+package auth
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+var errNoIDToken = errors.New("no id_token in oauth response")
+
+// oauthStateCookie carries the anti-CSRF state value from LoginHandler's
+// redirect through to CallbackHandler, which must see it match the `state`
+// query param Google echoes back before trusting the callback at all.
+const oauthStateCookie = "oauth_state"
+
+type UpsertedUser struct {
+	ID     uuid.UUID
+	Role   string
+	Status string
+}
+
+// UserUpserter persists/loads the user record for a verified identity.
+// Implemented by the users package's repository (Task 11).
+type UserUpserter interface {
+	UpsertFromIdentity(ctx context.Context, id Identity) (UpsertedUser, error)
+}
+
+// urlGenerator is implemented by GoogleVerifier; kept as its own small
+// interface (rather than reusing CodeVerifier) so LoginHandler only depends
+// on the one capability it actually needs.
+type urlGenerator interface {
+	LoginURL(state string) string
+}
+
+// LoginHandler starts the Google OAuth flow: generates a random state
+// value, stores it in a short-lived cookie, and redirects to Google's
+// consent screen. CallbackHandler verifies the returned state matches.
+type LoginHandler struct {
+	verifier     urlGenerator
+	cookieSecure bool
+}
+
+func NewLoginHandler(v urlGenerator, cookieSecure bool) *LoginHandler {
+	return &LoginHandler{verifier: v, cookieSecure: cookieSecure}
+}
+
+func (h *LoginHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		http.Error(w, "failed to start login", http.StatusInternalServerError)
+		return
+	}
+	state := base64.RawURLEncoding.EncodeToString(raw)
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookie,
+		Value:    state,
+		Path:     "/auth/google",
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   5 * 60,
+	})
+
+	http.Redirect(w, r, h.verifier.LoginURL(state), http.StatusFound)
+}
+
+type CallbackHandler struct {
+	verifier      CodeVerifier
+	users         UserUpserter
+	allowedDomain string
+	jwtSecret     string
+	frontendURL   string
+	cookieSecure  bool
+}
+
+func NewCallbackHandler(v CodeVerifier, u UserUpserter, allowedDomain, jwtSecret, frontendURL string, cookieSecure bool) *CallbackHandler {
+	return &CallbackHandler{verifier: v, users: u, allowedDomain: allowedDomain, jwtSecret: jwtSecret, frontendURL: frontendURL, cookieSecure: cookieSecure}
+}
+
+func (h *CallbackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "missing code", http.StatusBadRequest)
+		return
+	}
+
+	stateCookie, err := r.Cookie(oauthStateCookie)
+	if err != nil || stateCookie.Value == "" || stateCookie.Value != r.URL.Query().Get("state") {
+		http.Error(w, "invalid oauth state", http.StatusBadRequest)
+		return
+	}
+	// Consume the state cookie now that it's been checked, regardless of
+	// how the rest of the flow turns out — it's single-use.
+	http.SetCookie(w, &http.Cookie{
+		Name: oauthStateCookie, Value: "", Path: "/auth/google", MaxAge: -1,
+	})
+
+	identity, err := h.verifier.VerifyCode(r.Context(), code)
+	if err != nil {
+		http.Error(w, "oauth verification failed", http.StatusBadGateway)
+		return
+	}
+
+	if !ValidateCollegeIdentity(identity.Email, identity.HD, h.allowedDomain) {
+		http.Error(w, "account is not a verified college account", http.StatusForbidden)
+		return
+	}
+
+	user, err := h.users.UpsertFromIdentity(r.Context(), identity)
+	if err != nil {
+		http.Error(w, "failed to create session", http.StatusInternalServerError)
+		return
+	}
+
+	if user.Status == "banned" {
+		http.Error(w, "account is banned", http.StatusForbidden)
+		return
+	}
+
+	token, err := IssueToken(h.jwtSecret, user.ID, user.Role, 7*24*time.Hour)
+	if err != nil {
+		http.Error(w, "failed to issue session", http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   h.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   7 * 24 * 60 * 60,
+	})
+
+	http.Redirect(w, r, h.frontendURL, http.StatusFound)
+}
+```
+
+This changes `NewCallbackHandler`'s signature (adds a trailing `cookieSecure
+bool`), which breaks every existing call site in
+`internal/auth/handlers_test.go` (6 of them) and will need a matching
+`state` cookie + query param added to each existing test request, since the
+state check now runs before anything else. Update
+`internal/auth/handlers_test.go`:
+- Add `cookieSecure bool` (pass `false`, matching local/test behavior) as
+  the new 6th argument to every existing `NewCallbackHandler(...)` call.
+- Add a small test helper that builds a request carrying a matching
+  `oauth_state` cookie and `state` query param (e.g.
+  `withValidState(req, "test-state")` that sets `req.AddCookie(&http.Cookie{Name:
+  oauthStateCookie, Value: "test-state"})` and appends `&state=test-state`
+  to the request URL), and use it in every existing test's request
+  construction so they still exercise what they were testing before this
+  change (missing code, wrong domain, verifier error, upsert error, banned
+  user) rather than all now failing on the new state check instead.
+- Add two NEW tests: `TestCallbackHandler_MissingStateCookie_BadRequest`
+  (request has `code` and `state` query param but no `oauth_state` cookie —
+  must 400) and `TestCallbackHandler_StateMismatch_BadRequest` (cookie value
+  and query param `state` differ — must 400).
+- Add tests for the new `LoginHandler`: it should redirect
+  (`http.StatusFound`) to a URL produced by a fake `urlGenerator`, and set
+  an `oauth_state` cookie whose value appears in that redirect URL (a fake
+  `urlGenerator.LoginURL(state)` implementation can just echo `state` back
+  in a fixed URL template so the test can assert the cookie value and the
+  `Location` header's query string agree).
+
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/router/... -v`
+Run: `go test ./internal/router/... ./internal/auth/... -v`
 Expected: PASS
+
+- [ ] **Step 4.5: Add an admin-route auth-gating regression test to `router_test.go`**
+
+The router test file's own stated purpose (see the **Files** list above:
+"smoke test — public routes reachable, protected routes reject
+unauthenticated requests") only covers the unauthenticated case so far. Add
+an integration test (skipped without `DATABASE_URL`, following the
+established pattern in `internal/search/search_test.go` /
+`internal/moderation/flags_repository_test.go`) that connects a real pool,
+builds `router.New(Deps{JWTSecret: "test-secret", Pool: pool})`, issues a
+valid session cookie for a **non-admin** ("student") user via
+`auth.IssueToken`, and asserts a request to an admin-only route (e.g. `GET
+/api/admin/materials/pending`) returns `403 Forbidden` — not 401 (already
+covered) and not 200. This closes a test-coverage gap noted during Task 11's
+review (no regression test existed anywhere confirming `RequireAdmin`
+actually rejects a non-admin *authenticated* caller specifically on a
+real wired route, as opposed to unit-testing the middleware in isolation).
 
 - [ ] **Step 5: Wire `cmd/server/main.go`**
 
@@ -3378,6 +3633,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/AnupamSingh2004/iiitone-backend/internal/auth"
 	"github.com/AnupamSingh2004/iiitone-backend/internal/config"
@@ -3394,9 +3650,9 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
-	ctx := context.Background()
-
-	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := db.Connect(connectCtx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("db connect error: %v", err)
 	}
@@ -3412,18 +3668,22 @@ func main() {
 		log.Fatalf("storage init error: %v", err)
 	}
 
-	googleVerifier, err := auth.NewGoogleVerifier(ctx, cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL)
+	oauthCtx := context.Background()
+	googleVerifier, err := auth.NewGoogleVerifier(oauthCtx, cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL)
 	if err != nil {
 		log.Fatalf("oauth init error: %v", err)
 	}
 	userRepo := users.NewRepository(pool)
-	callbackHandler := auth.NewCallbackHandler(googleVerifier, userRepo, cfg.GoogleAllowedDomain, cfg.JWTSecret, cfg.FrontendURL)
+	cookieSecure := cfg.Env == "production"
+	loginHandler := auth.NewLoginHandler(googleVerifier, cookieSecure)
+	callbackHandler := auth.NewCallbackHandler(googleVerifier, userRepo, cfg.GoogleAllowedDomain, cfg.JWTSecret, cfg.FrontendURL, cookieSecure)
 
 	handler := router.New(router.Deps{
 		JWTSecret:    cfg.JWTSecret,
 		Pool:         pool,
 		Cache:        cache,
 		Store:        store,
+		AuthLogin:    loginHandler,
 		AuthCallback: callbackHandler,
 		FrontendURL:  cfg.FrontendURL,
 	})
@@ -3435,16 +3695,24 @@ func main() {
 }
 ```
 
+Note: `db.Connect` gets a 10s-bounded context so a genuinely unreachable
+database fails startup promptly with a clear error instead of hanging on
+whatever `pgxpool`'s own internal defaults happen to be; the OAuth provider
+discovery call (`NewGoogleVerifier`, which fetches Google's OIDC discovery
+document) intentionally keeps `context.Background()` since it's a one-time
+startup call with its own reasonable internal HTTP client timeout, not
+something this task needs to re-bound.
+
 - [ ] **Step 6: Build and smoke-test the full stack**
 
 Run: `docker compose up -d postgres redis minio minio-init && source .env && migrate -path ./migrations -database "$DATABASE_URL" up && go run ./cmd/server &`
 Then: `curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/healthz`
-Expected: `200`. Stop the server afterward (`kill %1` or `fg` + Ctrl-C).
+Expected: `200`. Also verify `curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/auth/google/login` redirects (`302`) rather than 404 — this route not existing at all was the original bug this pre-fix caught. Stop the server afterward (`kill %1` or `fg` + Ctrl-C).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/router cmd/server/main.go
+git add internal/router internal/auth cmd/server/main.go .env .env.example
 git commit -m "Wire router and main.go composition root"
 ```
 
