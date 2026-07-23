@@ -5,9 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16-alpine
@@ -26,12 +34,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.2"
+          cache: true
+          cache-dependency-path: go.sum
       - run: gofmt -l . | tee /tmp/fmt-out; test ! -s /tmp/fmt-out
       - run: go build ./...
       - run: go vet ./...
       - name: Run migrations
         run: |
-          go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+          go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           "$(go env GOPATH)/bin/migrate" -path ./migrations -database "postgres://iiitone:iiitone@localhost:5432/iiitone?sslmode=disable" up
       - name: Test
