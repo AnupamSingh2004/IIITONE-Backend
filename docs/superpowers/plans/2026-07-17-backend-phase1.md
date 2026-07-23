@@ -3718,6 +3718,196 @@ git commit -m "Wire router and main.go composition root"
 
 ---
 
+## Task 19.5: Material detail endpoint (GET /api/materials/{materialID})
+
+**Inserted after Task 19, found while writing Task 20's OpenAPI spec.** The
+frontend's material detail/PDF-viewer page
+(`iiitone-web/src/app/app/materials/[id]/page.tsx`) fetches `GET
+/api/materials/${id}` expecting `{id, title, type, courseName, fileUrl}`.
+`internal/materials/repository.go` already has a `GetByID`/`MaterialDetail`
+method (added during an earlier task's review, with a comment explicitly
+noting `fileUrl` must be derived by the handler from `FileKey` "e.g. a
+signed storage URL") — but no HTTP handler was ever written for it, and
+`internal/router/router.go` never wires the route. The material detail page
+is currently completely non-functional against the real backend (it has
+nothing to call). This must be fixed before Phase 1 can be considered done.
+
+**Files:**
+- Create: `internal/materials/detail_handler.go`
+- Test: `internal/materials/detail_handler_test.go`
+- Modify: `internal/storage/storage.go` (add a presigned-URL method to the `Store` interface)
+- Modify: `internal/storage/minio.go` (implement it)
+- Modify: `internal/router/router.go` (wire the route)
+- Modify: `docs/openapi.yaml` (add the path — coordinate with whatever Task 20 has already produced; if Task 20 was implemented first, add to the existing file; if this task lands first, Task 20's implementer must include this route)
+
+- [ ] **Step 1: Add a presigned-URL method to `storage.Store`**
+
+```go
+// internal/storage/storage.go — add to the Store interface:
+
+	// PresignedGetURL returns a time-limited URL the client can fetch the
+	// object from directly, without proxying bytes through this server.
+	PresignedGetURL(ctx context.Context, key string, expiry time.Duration) (string, error)
+```
+
+```go
+// internal/storage/minio.go — implement it:
+
+func (s *MinioStore) PresignedGetURL(ctx context.Context, key string, expiry time.Duration) (string, error) {
+	u, err := s.client.PresignedGetObject(ctx, s.bucket, key, expiry, url.Values{})
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+```
+
+(Needs `net/url` and `time` imports added to minio.go.) This changes the
+`Store` interface, so every existing implementation must satisfy it —
+`MinioStore` is the only real implementation
+(`var _ Store = (*MinioStore)(nil)` already asserts this at compile time, so
+a missed implementation fails the build immediately). Check
+`internal/materials/upload_handler_test.go`'s `fakeStore` and any other
+test fake implementing `storage.Store` across the codebase (grep for
+`storage.Store` and for structs with `Put`/`Get`/`Delete`/`Exists` methods)
+— every one needs this 5th method added too, or the package won't compile.
+
+- [ ] **Step 2: Write `internal/materials/detail_handler.go`**
+
+```go
+package materials
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+)
+
+const presignedURLExpiry = 15 * time.Minute
+
+type detailRepo interface {
+	GetByID(ctx context.Context, id uuid.UUID) (MaterialDetail, error)
+}
+
+// urlSigner is the one storage.Store capability DetailHandler needs, kept
+// as its own small interface (rather than depending on the full
+// storage.Store) so unit tests don't need a complete fake storage backend.
+type urlSigner interface {
+	PresignedGetURL(ctx context.Context, key string, expiry time.Duration) (string, error)
+}
+
+type DetailHandler struct {
+	repo  detailRepo
+	store urlSigner
+}
+
+func NewDetailHandler(repo detailRepo, store urlSigner) *DetailHandler {
+	return &DetailHandler{repo: repo, store: store}
+}
+
+// detailResponse matches the frontend's MaterialDetail interface exactly
+// (see iiitone-web's src/app/app/materials/[id]/page.tsx).
+type detailResponse struct {
+	ID         uuid.UUID `json:"id"`
+	Title      string    `json:"title"`
+	Type       string    `json:"type"`
+	CourseName string    `json:"courseName"`
+	FileURL    string    `json:"fileUrl"`
+}
+
+func (h *DetailHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "materialID"))
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+
+	detail, err := h.repo.GetByID(r.Context(), id)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	fileURL, err := h.store.PresignedGetURL(r.Context(), detail.FileKey, presignedURLExpiry)
+	if err != nil {
+		http.Error(w, "failed to generate file url", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(detailResponse{
+		ID: detail.ID, Title: detail.Title, Type: detail.Type,
+		CourseName: detail.CourseName, FileURL: fileURL,
+	})
+}
+```
+
+Note on access control: this endpoint doesn't filter by `status='approved'`
+or check the caller is the uploader/an admin — any authenticated user who
+knows a material's ID (an unguessable UUID) can view its detail and get a
+download URL, including for a still-pending material. This matches the
+existing trust model everywhere else in this codebase (e.g. none of the
+`/api/admin/*` moderation endpoints check "is this admin's own material"
+either, and materials are only ever discoverable via approved-only search
+results, the uploader's own session, or the admin queues) — `RequireAuth`
+being the perimeter and IDs being opaque is the established pattern, not a
+new gap introduced here. Don't add owner/status filtering unless asked;
+just be aware of it.
+
+- [ ] **Step 3: Write `internal/materials/detail_handler_test.go`**
+
+Unit tests (no DB needed — fake `detailRepo` and fake `urlSigner`, following
+the established pattern in `upload_handler_test.go`'s `fakeMaterialsRepo`/`fakeStore`):
+- `TestDetailHandler_Success_ReturnsFileURL` — fake repo returns a
+  `MaterialDetail`, fake signer returns a URL, assert 200 and the JSON body
+  has all 5 fields correct (including that `fileUrl` came from the signer,
+  not `FileKey` directly).
+- `TestDetailHandler_InvalidID_BadRequest` — malformed UUID path param → 400,
+  repo/signer never called.
+- `TestDetailHandler_NotFound_ReturnsNotFound` — fake repo returns an error →
+  404.
+- `TestDetailHandler_SigningFails_InternalServerError` — repo succeeds, fake
+  signer returns an error → 500 (this is the scenario that would previously
+  have silently broken the frontend if presigning failed for a valid
+  material — worth its own explicit test).
+
+- [ ] **Step 4: Wire the route in `internal/router/router.go`**
+
+Inside the existing `if deps.Pool != nil` (or unconditional, matching
+whatever Task 19 landed as) block that already constructs `matRepo :=
+materials.NewRepository(deps.Pool)`, add:
+
+```go
+detailHandler := materials.NewDetailHandler(matRepo, deps.Store)
+api.Get("/materials/{materialID}", detailHandler.ServeHTTP)
+```
+
+(Reuse the same `matRepo` already constructed for the upload handler —
+don't construct a second `materials.Repository`.)
+
+- [ ] **Step 5: Build, test, verify**
+
+Run `go build ./... && gofmt -l . && go vet ./...` and `go test
+./internal/materials/... ./internal/storage/... ./internal/router/...
+-v`. Also re-run the full `go test ./...` to confirm the `storage.Store`
+interface change didn't silently break any other fake implementation
+elsewhere in the codebase (a missing method there is a compile error, not a
+test failure, so `go build ./...` passing is actually the load-bearing
+check here).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add internal/materials/detail_handler.go internal/materials/detail_handler_test.go internal/storage/storage.go internal/storage/minio.go internal/router/router.go
+git commit -m "Add GET /api/materials/{id} detail endpoint with presigned file URL"
+```
+
+---
+
 ## Task 20: OpenAPI spec and ER diagram docs
 
 **Files:**
